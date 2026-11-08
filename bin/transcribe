@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# transcribe — turn a video URL (YouTube or any yt-dlp-supported site) or a local
+# video/audio file into a timestamped transcript in inbox/:
+#   inbox/<base>.txt        timestamped turns/paragraphs — what /wisdom-ingest reads
+#   inbox/<base>.srt        subtitles, one cue per segment
+#   inbox/<base>.json       normalized transcript (records which provider made it)
+#   inbox/<base>.meta.json  source metadata (yt-dlp info, or your .meta.json sidecar)
+#
+# Usage:
+#   bin/transcribe [--local | --mistral] [--force] "https://www.youtube.com/watch?v=..."
+#   bin/transcribe [--local | --mistral] [--force] path/to/recording.m4a
+#
+# Providers:
+#   mistral  cloud (Voxtral): speaker labels, needs MISTRAL_API_KEY, max 1 h per request
+#            (longer audio is chunked automatically)
+#   local    whisper.cpp on this machine: free, private, no length limit, many
+#            languages incl. Romanian; no speaker labels
+# Default: mistral if MISTRAL_API_KEY is available, otherwise local.
+#
+# Re-running on the same input re-uses the saved transcript unless --force.
+#
+# Env:
+#   TRANSCRIBE_PROVIDER       mistral | local (same as the flags)
+#   TRANSCRIBE_LANGUAGE       e.g. "ro". Local: forces the language (default: auto-detect).
+#                             Mistral: disables timestamps and speaker turns (the API
+#                             doesn't allow both), so leave it unset unless detection fails.
+#   TRANSCRIBE_KEEP_AUDIO=1   keep the original download (default: keep only the compact mp3)
+#   MISTRAL_API_KEY           from env, ~/.vibe/.env, or ./.env
+#   TRANSCRIBE_MODEL          Mistral model (default: voxtral-small-transcribe-3)
+#   TRANSCRIBE_CHUNK_SECONDS  Mistral chunk length (default 3300 = 55 min)
+#   WHISPER_MODEL             local model name (default: large-v3-turbo; large-v3 = best quality)
+#   WHISPER_MODEL_PATH        explicit path to a ggml model file
+
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
+
+FORCE=0
+INPUT=""
+PROVIDER="${TRANSCRIBE_PROVIDER:-}"
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    --local) PROVIDER=local ;;
+    --mistral) PROVIDER=mistral ;;
+    -h|--help) show_help; exit 0 ;;
+    -*) die "unknown option: $arg (see --help)" ;;
+    *) set_input "$arg" ;;
+  esac
+done
+[[ -n "$INPUT" ]] || die "usage: transcribe [--local | --mistral] [--force] <video-url | local-media-file>"
+
+need ffmpeg; need ffprobe ffmpeg; need python3
+load_env
+LANGUAGE="${TRANSCRIBE_LANGUAGE:-}"
+
+# --- 0. pick the provider and check it is usable before doing any work ----------
+EXPLICIT=1
+if [[ -z "$PROVIDER" ]]; then
+  EXPLICIT=0
+  if [[ -n "${MISTRAL_API_KEY:-}" ]]; then PROVIDER=mistral
+  elif command -v whisper-cli >/dev/null 2>&1; then PROVIDER=local
+  else
+    die "no transcription provider available. Either set MISTRAL_API_KEY (cloud, speaker labels)
+       or install whisper.cpp for local transcription: brew install whisper.cpp (see README)"
+  fi
+fi
+
+case "$PROVIDER" in
+  mistral)
+    need curl
+    : "${MISTRAL_API_KEY:?MISTRAL_API_KEY not set (checked environment, ~/.vibe/.env and ./.env)}"
+    MODEL="${TRANSCRIBE_MODEL:-voxtral-small-transcribe-3}"
+    CHUNK="${TRANSCRIBE_CHUNK_SECONDS:-3300}"
+    ;;
+  local)
+    need whisper-cli whisper.cpp
+    MODEL="${WHISPER_MODEL:-large-v3-turbo}"
+    MODEL_PATH="${WHISPER_MODEL_PATH:-$HOME/.cache/whisper.cpp/ggml-$MODEL.bin}"
+    if [[ ! -f "$MODEL_PATH" ]]; then
+      die "whisper model not found: $MODEL_PATH
+       Download it once (~1.6 GB for large-v3-turbo, ~3.1 GB for large-v3):
+         mkdir -p ~/.cache/whisper.cpp && curl -fL -o '$MODEL_PATH' \\
+           https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$MODEL.bin"
+    fi
+    ;;
+  *) die "unknown provider '$PROVIDER' (use mistral or local)" ;;
+esac
+
+AUDIO_DIR="$INBOX/audio"
+mkdir -p "$INBOX" "$AUDIO_DIR"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# --- 1. resolve a stable base name (same input → same files) -------------------
+IS_URL=0
+if [[ "$INPUT" =~ ^https?:// ]]; then
+  IS_URL=1
+  need yt-dlp
+  NAME="$(yt-dlp --restrict-filenames --no-playlist -o '%(title).70B-%(id)s.%(ext)s' \
+    --print filename "$INPUT" | head -1)"
+  BASE="$(sanitize "${NAME%.*}")"
+else
+  [[ -f "$INPUT" ]] || die "file not found: $INPUT"
+  SRC_NAME="$(basename "$INPUT")"
+  BASE="$(sanitize "${SRC_NAME%.*}")"
+fi
+[[ -n "$BASE" ]] || die "could not derive a file name for: $INPUT"
+
+JSON="$INBOX/$BASE.json"
+TXT="$INBOX/$BASE.txt"
+SRT="$INBOX/$BASE.srt"
+META="$INBOX/$BASE.meta.json"
+SPEECH="$AUDIO_DIR/$BASE.mp3"
+
+finish() {
+  python3 "$PYLIB/transcript.py" render "$JSON" "$TXT" "$SRT"
+  log "Done ($(python3 "$PYLIB/transcript.py" provider "$JSON")):"
+  printf '    %s\n' "$TXT" "$SRT" "$JSON" "$META"
+  echo
+  echo "Next: /wisdom-ingest @${TXT#"$REPO_ROOT"/}"
+}
+
+if [[ -f "$JSON" && "$FORCE" == 0 ]]; then
+  CACHED="$(python3 "$PYLIB/transcript.py" provider "$JSON")"
+  if [[ "$EXPLICIT" == 1 && "$CACHED" != "$PROVIDER" ]]; then
+    die "$JSON was made by '$CACHED'; pass --force to replace it with a '$PROVIDER' transcript"
+  fi
+  log "Already transcribed by $CACHED — re-using $JSON (pass --force to transcribe again)"
+  finish
+  exit 0
+fi
+
+# --- 2. get compact speech audio: mono, 16 kHz, 48 kbps --------------------------
+to_speech() { ffmpeg -y -v error -i "$1" -vn -ac 1 -ar 16000 -b:a 48k "$SPEECH"; }
+
+if [[ "$IS_URL" == 1 ]]; then
+  log "Downloading audio: $INPUT"
+  SRC="$(yt-dlp --restrict-filenames --no-playlist -f 'bestaudio/best' --write-info-json \
+    -P "$WORK" -o "$BASE.%(ext)s" --print after_move:filepath "$INPUT" | tail -1)"
+  log "Converting to speech-quality mp3"
+  to_speech "$SRC"
+  python3 "$PYLIB/meta.py" "$META" --ytdlp "$WORK/$BASE.info.json"
+  if [[ "${TRANSCRIBE_KEEP_AUDIO:-0}" == 1 ]]; then mv "$SRC" "$AUDIO_DIR/"; fi
+else
+  if [[ ! -f "$SPEECH" || "$FORCE" == 1 ]] && [[ "$(cd "$(dirname "$INPUT")" && pwd)/$(basename "$INPUT")" != "$SPEECH" ]]; then
+    log "Converting to speech-quality mp3: $INPUT"
+    to_speech "$INPUT"
+  fi
+  SIDECAR="$(sidecar_for "$INPUT")"
+  if [[ -n "$SIDECAR" ]]; then
+    log "Using sidecar metadata: $SIDECAR"
+    python3 "$PYLIB/meta.py" "$META" --sidecar "$SIDECAR" source_type=recording "resource=local:$SRC_NAME"
+  else
+    python3 "$PYLIB/meta.py" "$META" source_type=recording "resource=local:$SRC_NAME"
+  fi
+fi
+
+# --- 3a. Mistral provider: chunk to ≤ 1 h, transcribe each chunk with diarization ---
+# post <audio> <out.json> [extra -F fields...] → prints HTTP status
+post() {
+  local audio="$1" out="$2"; shift 2
+  curl -sS -o "$out" -w '%{http_code}' https://api.mistral.ai/v1/audio/transcriptions \
+    -H "Authorization: Bearer $MISTRAL_API_KEY" \
+    -F "model=$MODEL" -F "file=@$audio" "$@"
+}
+
+mistral_one() {
+  local audio="$1" out="$2" code
+  if [[ -n "$LANGUAGE" ]]; then
+    code="$(post "$audio" "$out" -F "language=$LANGUAGE")"
+  else
+    code="$(post "$audio" "$out" -F timestamp_granularities=segment -F diarize=true)"
+    if [[ "$code" == 400 || "$code" == 422 ]]; then
+      log "Request rejected (HTTP $code: $(head -c 200 "$out")) — retrying without diarization"
+      code="$(post "$audio" "$out" -F timestamp_granularities=segment)"
+    fi
+  fi
+  if [[ "$code" != 200 ]]; then
+    echo "transcription failed (HTTP $code):" >&2
+    cat "$out" >&2; echo >&2
+    exit 1
+  fi
+}
+
+transcribe_mistral() {
+  local duration chunk len parts="" offset=0 n=0
+  duration="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$SPEECH")"
+  if awk -v d="$duration" -v c="$CHUNK" 'BEGIN { exit !(d > c) }'; then
+    log "Audio is ${duration%.*}s — splitting into ${CHUNK}s chunks"
+    ffmpeg -y -v error -i "$SPEECH" -f segment -segment_time "$CHUNK" -reset_timestamps 1 \
+      -c copy "$WORK/chunk-%03d.mp3"
+  else
+    cp "$SPEECH" "$WORK/chunk-000.mp3"
+  fi
+  for chunk in "$WORK"/chunk-*.mp3; do
+    len="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$chunk")"
+    # ffmpeg can leave a sliver of a last chunk; don't pay for transcribing silence
+    if [[ "$n" -gt 0 ]] && awk -v l="$len" 'BEGIN { exit !(l < 2) }'; then
+      continue
+    fi
+    n=$((n + 1))
+    log "Transcribing (mistral, $MODEL) chunk $n: $BASE"
+    mistral_one "$chunk" "$chunk.json"
+    parts="$parts $chunk.json:$offset"
+    offset="$(awk -v a="$offset" -v b="$len" 'BEGIN { printf "%.3f", a + b }')"
+  done
+  # shellcheck disable=SC2086  # parts is a space-separated list of safe temp paths
+  python3 "$PYLIB/transcript.py" merge "$JSON" mistral $parts
+}
+
+# --- 3b. local provider: whisper.cpp, whole file at once -------------------------
+transcribe_local() {
+  log "Transcribing (local, whisper $MODEL, language ${LANGUAGE:-auto}): $BASE"
+  ffmpeg -y -v error -i "$SPEECH" -ac 1 -ar 16000 -c:a pcm_s16le "$WORK/audio.wav"
+  # whisper-cli defaults to English, so always pass a language (auto = detect)
+  whisper-cli -m "$MODEL_PATH" -f "$WORK/audio.wav" -l "${LANGUAGE:-auto}" \
+    -oj -of "$WORK/whisper" -np >/dev/null 2>"$WORK/whisper.log" \
+    || { tail -20 "$WORK/whisper.log" >&2; die "whisper-cli failed"; }
+  python3 "$PYLIB/transcript.py" from-whisper "$WORK/whisper.json" "$JSON" "$MODEL"
+}
+
+"transcribe_$PROVIDER"
+finish

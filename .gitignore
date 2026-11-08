@@ -1,0 +1,18 @@
+# Personal content never goes in this public repo:
+#   library/ — your notes (a separate, private git repo)
+#   inbox/   — raw transcripts and audio
+library/
+inbox/
+*.mp3
+*.webm
+*.m4a
+*.wav
+
+# secrets
+.env
+*.env
+
+# OS / tooling noise
+.DS_Store
+__pycache__/
+*.pyc

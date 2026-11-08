@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# extract — turn a text source into clean text in inbox/, ready for /wisdom-ingest.
+# Everything runs locally; no API key needed.
+#
+#   PDF          → pdftotext for pages with a text layer, Tesseract OCR for scanned pages
+#                  (output keeps <!-- page N --> markers so notes can cite pages)
+#   web article  → fetched and stripped to the main content
+#   text / md    → copied as-is
+#
+# Also writes inbox/<base>.meta.json (title, author, resource, ...). A sidecar
+# <file>.meta.json next to a local input is merged in.
+#
+# Usage:
+#   bin/extract [--force] path/to/book.pdf
+#   bin/extract [--force] "https://example.com/article"   # or article:https://...
+#   bin/extract [--force] path/to/notes.md
+#
+# Env:
+#   OCR_LANG   Tesseract languages for scanned pages (default: eng+ron)
+
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
+
+FORCE=0
+INPUT=""
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    -h|--help) show_help; exit 0 ;;
+    -*) die "unknown option: $arg (see --help)" ;;
+    *) set_input "$arg" ;;
+  esac
+done
+[[ -n "$INPUT" ]] || die "usage: extract [--force] <pdf-file | article-url | text-file>"
+INPUT="${INPUT#article:}"
+
+need python3
+mkdir -p "$INBOX"
+
+# skip_if_done <out> — same input → same file; don't redo work unless --force
+skip_if_done() {
+  if [[ -f "$1" && "$FORCE" == 0 ]]; then
+    log "Already extracted — re-using $1 (pass --force to redo)"
+    next "$1"
+    exit 0
+  fi
+}
+next() { echo "Next: /wisdom-ingest @${1#"$REPO_ROOT"/}"; }
+
+if [[ "$INPUT" =~ ^https?:// ]]; then
+  need curl
+  BASE="$(sanitize "$(printf '%s' "$INPUT" | sed -E 's|^https?://(www\.)?||; s|[?#].*$||; s|/$||')")"
+  OUT="$INBOX/$BASE.txt"
+  skip_if_done "$OUT"
+  HTML="$(mktemp)"
+  trap 'rm -f "$HTML"' EXIT
+  log "Fetching article: $INPUT"
+  CTYPE="$(curl -fsSL --max-time 60 -A "Mozilla/5.0 (compatible; wisdom-library)" \
+    -o "$HTML" -w '%{content_type}' "$INPUT")" || die "could not fetch $INPUT (HTTP error or network failure)"
+  TITLE="$(python3 "$PYLIB/html2text.py" "$INPUT" "$HTML" "$OUT" "$CTYPE")"
+  python3 "$PYLIB/meta.py" "$INBOX/$BASE.meta.json" source_type=article "resource=$INPUT" "title=$TITLE"
+
+else
+  [[ -f "$INPUT" ]] || die "file not found: $INPUT"
+  NAME="$(basename "$INPUT")"
+  BASE="$(sanitize "${NAME%.*}")"
+  SIDECAR="$(sidecar_for "$INPUT")"
+  META_ARGS=("$INBOX/$BASE.meta.json")
+  [[ -n "$SIDECAR" ]] && META_ARGS+=(--sidecar "$SIDECAR")
+
+  case "$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]')" in
+    *.pdf)
+      need pdftotext poppler; need pdftoppm poppler; need pdfinfo poppler; need pdfimages poppler
+      OUT="$INBOX/$BASE.md"
+      skip_if_done "$OUT"
+      log "Extracting PDF locally: $INPUT"
+      SUMMARY="$(python3 "$PYLIB/pdf2text.py" "$INPUT" "$OUT" "${OCR_LANG:-eng+ron}")"
+      TITLE="$(printf '%s' "$SUMMARY" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("title",""))')"
+      AUTHOR="$(printf '%s' "$SUMMARY" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("author",""))')"
+      OCR="$(printf '%s' "$SUMMARY" | python3 -c 'import json,sys; p=json.load(sys.stdin).get("ocr_pages"); print(",".join(map(str,p)) if p else "")')"
+      [[ -n "$OCR" ]] && log "OCR'd scanned pages: $OCR"
+      python3 "$PYLIB/meta.py" "${META_ARGS[@]}" source_type=pdf "resource=local:$NAME" \
+        "title=$TITLE" "author=$AUTHOR" "ocr_pages=$OCR"
+      ;;
+    *)
+      OUT="$INBOX/$BASE.md"
+      skip_if_done "$OUT"
+      cp "$INPUT" "$OUT"
+      python3 "$PYLIB/meta.py" "${META_ARGS[@]}" source_type=text "resource=local:$NAME"
+      ;;
+  esac
+fi
+
+log "Done: $OUT"
+next "$OUT"

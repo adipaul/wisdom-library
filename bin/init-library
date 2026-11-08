@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# init-library — set up library/, the private home of your notes.
+#
+# library/ is its own git repository (keep it private) and is gitignored here, so
+# your notes never end up in this public repo.
+#
+# Usage:
+#   bin/init-library                 # create an empty library with git init
+#   bin/init-library <git-url>       # clone your existing private notes repo
+#
+# Safe to re-run: on an existing library it only (re)installs the pre-commit hook
+# that runs bin/check. library/ may also be a symlink to a notes repo elsewhere.
+# Re-run it after moving this folder, so the hook points at the new bin/check.
+
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
+need git
+
+if [[ -d "$LIBRARY" ]]; then
+  log "library/ already exists — leaving its content alone"
+elif [[ -n "${1:-}" ]]; then
+  log "Cloning $1 into library/"
+  git clone "$1" "$LIBRARY"
+else
+  log "Creating an empty library in library/"
+  mkdir -p "$LIBRARY/notes" "$LIBRARY/methods" "$LIBRARY/journal"
+  touch "$LIBRARY/methods/.gitkeep" "$LIBRARY/journal/.gitkeep"
+  cat > "$LIBRARY/notes/index.md" <<'EOF'
+# Notes index
+
+OKF directory listing (reserved filename). One concept document per source.
+EOF
+  cat > "$LIBRARY/README.md" <<'EOF'
+# Wisdom library — notes (private)
+
+- `notes/` — OKF v0.2 bundle, one note per source; `index.md` is the directory listing
+- `methods/` — merged methods per usage area
+- `journal/` — decision records from `/wisdom-apply`
+EOF
+  printf '.DS_Store\n' > "$LIBRARY/.gitignore"
+  git -C "$LIBRARY" init -q -b main
+  echo "    Add a PRIVATE remote: git -C library remote add origin <url>"
+fi
+
+if [[ -d "$LIBRARY/.git" ]]; then
+  HOOK="$LIBRARY/.git/hooks/pre-commit"
+  # Absolute path, so the hook also works when library/ is a symlink to a folder
+  # elsewhere. If you move this wisdom-library folder, re-run bin/init-library.
+  cat > "$HOOK" <<EOF
+#!/bin/sh
+# installed by bin/init-library — validate notes before each commit.
+# If you move the wisdom-library folder, re-run bin/init-library to update this path.
+check="$REPO_ROOT/bin/check"
+[ -x "\$check" ] || { echo "pre-commit: \$check not found — re-run bin/init-library" >&2; exit 1; }
+exec "\$check" "\$(git rev-parse --show-toplevel)"
+EOF
+  chmod +x "$HOOK"
+  log "Installed pre-commit hook (runs $REPO_ROOT/bin/check)"
+fi

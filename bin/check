@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""check — validate the notes library and the agent skills, and report each usage area.
+
+Usage: bin/check [LIBRARY_DIR]     (default: library/ next to bin/)
+
+Errors (exit status 1): broken frontmatter, naming, index, or method references.
+Warnings (exit status 0): an area with enough notes but no method yet, or a method
+that hasn't taken a note from its area into account. /wisdom-ingest normally keeps
+methods current automatically; a warning means that step was skipped.
+Installed as a pre-commit hook by bin/init-library.
+
+Frontmatter is read with a small stdlib parser, not a full YAML parser. It
+supports exactly what notes, methods, and skills use:
+  key: value              (the rest of the line, so quoted colons are fine)
+  key: [a, b, c]          (flow list of plain words, e.g. usage_areas, notes)
+  key:                    followed by "  - item" lines (block list)
+  key: >-                 followed by indented lines (folded text, skills only)
+Nested maps (e.g. sources:, generated:) are only checked for presence.
+"""
+import argparse
+import re
+import sys
+from pathlib import Path
+
+REQUIRED = ["type", "title", "description", "resource", "status", "tags", "sources",
+            "generated", "date_added", "usage_areas"]
+USAGE_AREAS = ["decisions", "idea-testing", "brainstorming", "discussions"]
+METHOD_THRESHOLD = 3  # notes needed before a first method is built automatically
+RESERVED = {"index.md", "log.md"}
+NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*--[a-z0-9]+(-[a-z0-9]+)*\.md$")
+
+
+def frontmatter(path):
+    """Return {top-level key: raw value} or None. Block lists are stored under 'key.items'."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    try:
+        end = lines.index("---", 1)
+    except ValueError:
+        return None
+    fields, key = {}, None
+    for line in lines[1:end]:
+        m = re.match(r"^([A-Za-z_][\w-]*):\s*(.*)$", line)
+        if m:
+            key = m.group(1)
+            fields[key] = m.group(2).strip()
+        elif key and re.match(r"^\s+-\s+", line) and not fields[key]:
+            fields[key + ".items"] = fields.get(key + ".items", []) + [line.split("-", 1)[1].strip()]
+    return fields
+
+
+def as_list(fields, key):
+    raw = fields.get(key, "")
+    if raw.startswith("[") and raw.endswith("]"):
+        return [x.strip().strip("'\"") for x in raw[1:-1].split(",") if x.strip()]
+    return fields.get(key + ".items", [])
+
+
+def check_skills(repo, errors, warnings):
+    """Agent skills: valid frontmatter (an unquoted ': ' breaks YAML parsers and the
+    skill silently fails to load), name matches folder, Claude Code links resolve."""
+    skills_dir = repo / ".agents" / "skills"
+    if not skills_dir.is_dir():
+        return 0
+    skills = sorted(skills_dir.glob("*/SKILL.md"))
+    for skill in skills:
+        where = skill.relative_to(repo)
+        lines = skill.read_text(encoding="utf-8").splitlines()
+        if not lines or lines[0].strip() != "---" or "---" not in lines[1:]:
+            errors.append(f"{where}: missing --- frontmatter block")
+            continue
+        fields, key = {}, None
+        for line in lines[1:lines.index("---", 1)]:
+            m = re.match(r"^([A-Za-z_][\w-]*):\s*(.*)$", line)
+            if m:
+                key, value = m.group(1), m.group(2).strip()
+                fields[key] = "" if value in (">", ">-", "|", "|-") else value
+                if value and value[0] not in "\"'>|[{" and ": " in value:
+                    errors.append(f"{where}: '{key}' contains an unquoted ': ' — invalid YAML; "
+                                  "quote it or use a '>-' block")
+            elif key and line.startswith((" ", "\t")):
+                fields[key] = (fields[key] + " " + line.strip()).strip()
+        if fields.get("name") != skill.parent.name:
+            errors.append(f"{where}: name '{fields.get('name')}' must match its folder '{skill.parent.name}'")
+        description = fields.get("description", "")
+        if not description:
+            errors.append(f"{where}: missing description")
+        elif len(description) > 1024:
+            errors.append(f"{where}: description is {len(description)} chars (max 1024)")
+        link = repo / ".claude" / "skills" / skill.parent.name
+        if not (link / "SKILL.md").exists():
+            warnings.append(f".claude/skills/{skill.parent.name}: missing or broken link — Claude Code "
+                            f"won't see this skill (ln -s ../../.agents/skills/{skill.parent.name} {link.relative_to(repo)})")
+    return len(skills)
+
+
+def main(argv):
+    repo = Path(__file__).resolve().parent.parent
+    ap = argparse.ArgumentParser(prog="bin/check", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog="\n\n".join(__doc__.split("\n\n")[1:]))
+    ap.add_argument("library", nargs="?", default=str(repo / "library"),
+                    help="library folder to check (default: library/ next to bin/)")
+    lib = Path(ap.parse_args(argv).library)
+    notes_dir, methods_dir = lib / "notes", lib / "methods"
+    if not notes_dir.is_dir():
+        sys.exit(f"error: {notes_dir} not found — run bin/init-library first")
+
+    errors, warnings = [], []
+    rel = lambda path: path.relative_to(lib)
+    notes = sorted(p for p in notes_dir.glob("*.md") if p.name not in RESERVED)
+    by_area = {area: [] for area in USAGE_AREAS}
+
+    # --- notes ---------------------------------------------------------------
+    for note in notes:
+        if not NAME_RE.match(note.name):
+            errors.append(f"{rel(note)}: name must be <topic>--<name>.md (lowercase, hyphens)")
+        fm = frontmatter(note)
+        if fm is None:
+            errors.append(f"{rel(note)}: missing --- frontmatter block")
+            continue
+        for key in REQUIRED:
+            if key not in fm:
+                errors.append(f"{rel(note)}: missing frontmatter key '{key}'")
+        if "date_added" in fm and not re.match(r"^\d{4}-\d{2}-\d{2}$", fm["date_added"]):
+            errors.append(f"{rel(note)}: date_added must be YYYY-MM-DD")
+        areas = as_list(fm, "usage_areas")
+        if "usage_areas" in fm and not areas:
+            errors.append(f"{rel(note)}: usage_areas is empty")
+        for area in areas:
+            if area in by_area:
+                by_area[area].append(note.name)
+            else:
+                errors.append(f"{rel(note)}: unknown usage area '{area}' "
+                              f"(allowed: {', '.join(USAGE_AREAS)})")
+        if len(areas) > 2:
+            warnings.append(f"{rel(note)}: tagged with {len(areas)} usage areas — keep only the "
+                            "1-2 where it has real, usable content, or every method gets the same input")
+
+    # --- index ---------------------------------------------------------------
+    index = notes_dir / "index.md"
+    if not index.exists():
+        errors.append("notes/index.md: missing")
+    else:
+        links = set(re.findall(r"\]\(([^)#\s]+)\)", index.read_text(encoding="utf-8")))
+        names = {Path(link).name for link in links}
+        for note in notes:
+            if note.name not in names:
+                errors.append(f"{rel(note)}: not listed in notes/index.md")
+        for link in sorted(links):
+            if not link.startswith(("http://", "https://")) and not (notes_dir / link).resolve().exists():
+                errors.append(f"notes/index.md: broken link '{link}'")
+
+    # --- methods -------------------------------------------------------------
+    methods = {}
+    for method in sorted(methods_dir.glob("*.md")) if methods_dir.is_dir() else []:
+        fm = frontmatter(method) or {}
+        area = fm.get("area") or method.stem
+        if area not in by_area:
+            errors.append(f"{rel(method)}: unknown area '{area}' (allowed: {', '.join(USAGE_AREAS)})")
+            continue
+        if method.stem != area:
+            errors.append(f"{rel(method)}: file name must match its area ({area}.md)")
+        listed = [Path(ref).name for ref in as_list(fm, "notes")]
+        for ref in listed:
+            if not (notes_dir / ref).exists():
+                errors.append(f"{rel(method)}: lists note '{ref}', which does not exist")
+            elif ref not in by_area[area]:
+                warnings.append(f"{rel(method)}: lists '{ref}', which is no longer tagged '{area}'")
+        missing = [n for n in by_area[area] if n not in listed]
+        if missing:
+            warnings.append(f"{rel(method)}: hasn't taken {len(missing)} note(s) into account: "
+                            f"{', '.join(missing)} — run /wisdom-build {area}")
+        methods[area] = (fm, missing)
+
+    for area, area_notes in by_area.items():
+        if area not in methods and len(area_notes) >= METHOD_THRESHOLD:
+            warnings.append(f"{area}: {len(area_notes)} notes but no method yet — run /wisdom-build {area}")
+
+    n_skills = check_skills(repo, errors, warnings)
+
+    # --- report --------------------------------------------------------------
+    print("Areas:")
+    for area, area_notes in by_area.items():
+        if area in methods:
+            fm, missing = methods[area]
+            when = fm.get("updated") or fm.get("built") or "?"
+            state = f"method updated {when}" + (f", {len(missing)} note(s) not in it" if missing else ", current")
+        else:
+            state = f"no method yet (first one is built at {METHOD_THRESHOLD} notes)"
+        print(f"  {area:<14} {len(area_notes)} note(s) — {state}")
+
+    if warnings:
+        print("\nWarnings:")
+        print("\n".join(f"  {w}" for w in warnings))
+    if errors:
+        print("\nErrors:")
+        print("\n".join(f"  {e}" for e in errors))
+        print(f"\n{len(errors)} error(s) found.")
+        return 1
+    print(f"\nOK: {len(notes)} note(s), {len(methods)} method(s), {n_skills} skill(s)"
+          + (f", {len(warnings)} warning(s)" if warnings else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
