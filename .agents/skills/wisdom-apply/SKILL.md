@@ -1,5 +1,6 @@
 ---
 name: wisdom-apply
+user-invocable: true
 description: Apply the wisdom library to a personal situation (a decision, a discussion, an idea, or "how would this go?"). Reads library/notes/index.md and the relevant notes and methods, applies their frameworks to the actual situation, and cites the source note for each idea. Can save a decision record to library/journal/. Invoke as /wisdom-apply <situation>.
 ---
 

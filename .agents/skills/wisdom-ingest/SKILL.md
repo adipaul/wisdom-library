@@ -1,5 +1,6 @@
 ---
 name: wisdom-ingest
+user-invocable: true
 description: >-
   Add any source to the wisdom library in one step — video/audio URL or file
   (transcribed via bin/transcribe), PDF (local text extraction/OCR via

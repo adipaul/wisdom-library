@@ -1,5 +1,6 @@
 ---
 name: wisdom-build
+user-invocable: true
 description: Rebuild (or build early) the combined method for one usage area (decisions, idea-testing, brainstorming, discussions) from all of its notes into library/methods/<area>.md. On demand only — /wisdom-ingest already creates and updates methods automatically. Invoke as /wisdom-build <area>.
 ---
 
